@@ -2,19 +2,24 @@ package com.example.edge
 
 import org.springframework.boot.autoconfigure.SpringBootApplication
 import org.springframework.boot.runApplication
+import org.springframework.cloud.client.loadbalancer.LoadBalanced
 import org.springframework.cloud.gateway.route.builder.RouteLocatorBuilder
 import org.springframework.cloud.gateway.route.builder.filters
 import org.springframework.cloud.gateway.route.builder.routes
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.graphql.data.method.annotation.Argument
+import org.springframework.graphql.data.method.annotation.MutationMapping
 import org.springframework.graphql.data.method.annotation.QueryMapping
 import org.springframework.graphql.data.method.annotation.SchemaMapping
+import org.springframework.http.HttpHeaders
 import org.springframework.messaging.rsocket.RSocketRequester
 import org.springframework.messaging.rsocket.retrieveFlux
+import org.springframework.messaging.simp.annotation.SubscribeMapping
 import org.springframework.stereotype.Component
 import org.springframework.stereotype.Controller
 import org.springframework.web.bind.annotation.GetMapping
+import org.springframework.web.bind.annotation.PathVariable
 import org.springframework.web.bind.annotation.ResponseBody
 import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.reactive.function.client.bodyToFlux
@@ -32,32 +37,42 @@ fun main(args: Array<String>) {
 @Configuration
 class GatewayConfiguration {
 
-    // todo also show the rate limiter and some of the other stuff?
+
     @Bean
     fun gateway(rlb: RouteLocatorBuilder) =
-        rlb
-            .routes {
-                route {
-                    path("/proxy")
-                    filters {
-                        setPath("/customers")
-                    }
-                    uri("http://localhost:8080/")
+        rlb.routes {
+            route {
+                path("/proxy") and host("*.spring.io")
+                filters {
+                    setPath("/customers")
+                    addResponseHeader(
+                        HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN,
+                        "*"
+                    )
                 }
-
+                uri("lb://customers")
             }
-
+        }
 }
 
 @Configuration
 class CrmConfiguration {
 
+    @LoadBalanced
     @Bean
-    fun http(wb: WebClient.Builder) = wb.build()
+    fun httpBuilder() = WebClient.builder()
 
     @Bean
-    fun rsocket(rs: RSocketRequester.Builder) = rs.tcp("localhost", 8181)
+    fun http(wc: WebClient.Builder) = wc.build()
+
+    @Bean
+    fun rsocket(rc: RSocketRequester.Builder) = rc.tcp("localhost", 8181)
+
 }
+
+data class CustomerOrders(val customer: Customer, val orders: List<Order>)
+data class Order(val id: Int, val customerId: Int)
+data class Customer(val id: Int, val name: String)
 
 @Component
 class CrmClient(
@@ -65,48 +80,69 @@ class CrmClient(
     private val rsocket: RSocketRequester
 ) {
 
-    fun orders(cid: Int): Flux<Order> =
-        rsocket.route("orders.{cid}", cid).retrieveFlux<Order>()
-            .retry(2)
-            .timeout(Duration.ofSeconds(1))
-            .switchIfEmpty(Flux.empty())
 
-    fun customers(): Flux<Customer> =
-        http.get().uri("http://localhost:8080/customers").retrieve()
+    fun customerOrders(): Flux<CustomerOrders> = this.customers()
+        .flatMap {
+            Mono.zip(
+                Mono.just(it),
+                this.orders(it.id).collectList()
+            )
+        }
+        .map { CustomerOrders(it.t1, it.t2) }
+
+    fun orders(customerId: Int) = this.rsocket
+        .route("orders.{customerId}", customerId)
+        .retrieveFlux<Order>()
+        .retry(10)
+        .onErrorResume { Flux.empty<Order>() }
+        .timeout(Duration.ofSeconds(10))
+
+    fun customers() =
+        this.http.get().uri("http://customers/customers").retrieve()
             .bodyToFlux<Customer>()
-            .retry(2)
-            .timeout(Duration.ofSeconds(1))
-            .switchIfEmpty(Flux.empty())
-
-    fun customerOrders(): Flux<CustomerOrders> =
-        this.customers()
-            .flatMap { c -> Mono.zip(Mono.just(c), orders(c.id).collectList()) }
-            .map { t2 -> CustomerOrders(t2.t1, t2.t2) }
+            .retry(10)
+            .onErrorResume { Flux.empty<Customer>() }
+            .timeout(Duration.ofSeconds(10))
 
 
 }
 
-data class CustomerOrders(val customer: Customer, val orders: Collection<Order>)
-data class Customer(val id: Int, val name: String)
-data class Order(val id: Int, val customerId: Int)
+@Controller
+class CrmClientGraphqlController(private val crmClient: CrmClient) {
+//
+//    @QueryMapping
+//    fun orders(@Argument customerId: Int) = this.crmClient.orders(customerId)
+
+    @MutationMapping
+    fun update(@Argument id: Int) : Int  {
+        println("the id is ${id}.")
+        return 42
+    }
+
+    @SubscribeMapping
+    fun numbers() = Flux.just(1, 2, 3).delayElements(Duration.ofSeconds(1))
+
+    @QueryMapping
+    fun customers(): Flux<Customer> = this.crmClient.customers()
+
+    @SchemaMapping
+    fun orders(customer: Customer) = this.crmClient.orders(customer.id)
+
+
+//    @SchemaMapping(typeName = "Query", field = "customers")
+//    fun customers() = this.crmClient.customers()
+}
 
 @Controller
 @ResponseBody
-class CrmRestController(private val crm: CrmClient) {
+class CrmClientRestController(private val crmClient: CrmClient) {
+
+    @GetMapping("/customers")
+    fun customers() = this.crmClient.customers()
+
+    @GetMapping("/orders/{cid}")
+    fun orders(@PathVariable cid: Int) = this.crmClient.orders(cid)
 
     @GetMapping("/cos")
-    fun cos() = this.crm.customerOrders()
-}
-
-@Controller
-class CrmGraphqlController(private val crm: CrmClient) {
-
-    @QueryMapping
-    fun orders(@Argument customerId: Int) = this.crm.orders(customerId)
-
-    @QueryMapping
-    fun customers() = this.crm.customers()
-
-    @SchemaMapping
-    fun orders(customer: Customer) = this.crm.orders(customer.id)
+    fun customerOrders() = this.crmClient.customerOrders()
 }

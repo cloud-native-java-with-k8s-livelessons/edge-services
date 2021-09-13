@@ -13,4 +13,3 @@ public class EurekaApplication {
 	}
 
 }
-// 22 font

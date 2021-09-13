@@ -1,15 +1,23 @@
-type Query  {
-    orders(customerId : ID):  [Order]
-    customers : [Customer]
+type Mutation {
+    update ( id :ID )  : Int
+}
+
+type Subscription {
+    numbers  : [Int]
+}
+
+type Query {
+    #    orders  ( customerId : ID) : [Order]
+    customers: [Customer]
 }
 
 type Order {
-    id: ID
+    id :ID
     customerId: ID
 }
 
 type Customer {
-    id: ID
+    id:ID
     name: String
-    orders: [Order]
+    orders : [Order]
 }
